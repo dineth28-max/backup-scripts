@@ -3,7 +3,7 @@
 # Installed with: ./scripts/install_cron.sh
 # (merges these lines into the current user's crontab instead of overwriting it)
 #
-# One daily job does everything: BACKUP DATABASE -> gzip -> upload -> GCS
+# One daily job does everything: sqlpackage export (.bacpac) -> upload -> GCS
 # daily/, and also copies into weekly/ on Sundays and monthly/ on the 1st —
 # see backup_mssql.sh.
 

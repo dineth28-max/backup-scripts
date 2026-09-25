@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# Backs up a single SQL Server database (running in its own local Docker
-# container) to GCS. Backup-only by design: no restore script.
+# Exports a single SQL Server database as a .bacpac (schema + data, via
+# SqlPackage) to GCS. Backup-only by design: no restore script.
+#
+# Unlike a native BACKUP DATABASE, SqlPackage is a host-side tool that
+# connects to SQL Server over the network like any client — this does not
+# use `docker exec` at all, it just needs the container's port reachable.
 
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "${DIR}/../lib/common.sh"
 
-: "${MSSQL_CONTAINER:?missing in backup.env}"
+: "${MSSQL_HOST:?missing in backup.env}"
+: "${MSSQL_PORT:?missing in backup.env}"
 : "${MSSQL_USER:?missing in backup.env}"
 : "${MSSQL_PASSWORD_FILE:?missing in backup.env}"
 : "${MSSQL_DATABASE:?missing in backup.env}"
+: "${BACKUP_NAME_PREFIX:?missing in backup.env}"
 
 DRY_RUN=0
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
@@ -18,8 +24,11 @@ DRY_RUN=0
 acquire_lock
 log INFO "=== backup_mssql.sh starting (db=${MSSQL_DATABASE}, dry_run=${DRY_RUN}) ==="
 
-# Reads the sa password from a file — never as a CLI arg, which would leak it
-# into `ps`/`docker inspect`.
+# Reads the sa password from a file. Note: unlike sqlcmd's SQLCMDPASSWORD env
+# var, SqlPackage has no equivalent env-var pickup for /SourcePassword — it
+# has to be passed as a CLI arg below, which is visible to other local users
+# via `ps` for the duration of the export. Restrict shell access to this host
+# accordingly; this is a real limitation of the SqlPackage CLI, not a bug here.
 mssql_password() {
   [[ -f "$MSSQL_PASSWORD_FILE" ]] || die "MSSQL_PASSWORD_FILE not found: $MSSQL_PASSWORD_FILE"
   cat "$MSSQL_PASSWORD_FILE"
@@ -29,38 +38,24 @@ STAMP="$(date +%F_%H%M%S)"
 WORKDIR="${BACKUP_TMP_DIR}/${STAMP}"
 mkdir -p "$WORKDIR"
 
-BAK_NAME="${MSSQL_DATABASE}_${STAMP}.bak"
-CONTAINER_BAK_PATH="/var/opt/mssql/backup/${BAK_NAME}"
-LOCAL_BAK_PATH="${WORKDIR}/${BAK_NAME}"
-OUTFILE="${LOCAL_BAK_PATH}.gz"
+OUTFILE="${WORKDIR}/${BACKUP_NAME_PREFIX}_${STAMP}.bacpac"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  log INFO "[dry-run] skipping BACKUP DATABASE / GCS upload for ${MSSQL_DATABASE}"
+  log INFO "[dry-run] skipping SqlPackage export / GCS upload for ${MSSQL_DATABASE}"
 else
-  log INFO "Running BACKUP DATABASE [${MSSQL_DATABASE}] inside ${MSSQL_CONTAINER}"
-  docker exec "$MSSQL_CONTAINER" mkdir -p /var/opt/mssql/backup \
-    || die "Could not create backup dir inside ${MSSQL_CONTAINER}"
+  log INFO "Exporting ${MSSQL_DATABASE} -> ${OUTFILE} via SqlPackage"
+  sqlpackage /Action:Export \
+    /SourceServerName:"${MSSQL_HOST},${MSSQL_PORT}" \
+    /SourceDatabaseName:"${MSSQL_DATABASE}" \
+    /SourceUser:"${MSSQL_USER}" \
+    /SourcePassword:"$(mssql_password)" \
+    /SourceTrustServerCertificate:True \
+    /TargetFile:"${OUTFILE}" \
+    || die "SqlPackage export failed for ${MSSQL_DATABASE}"
 
-  # SQLCMDPASSWORD env var (not -P on the command line) keeps the password
-  # out of argv, same rationale as the file-based read above.
-  # -C: trust the server's self-signed cert (ODBC Driver 18 defaults to
-  #     Encrypt=Mandatory + cert validation, which a self-signed cert fails).
-  # -b: exit non-zero on a T-SQL error inside -Q, not just on connection failure.
-  docker exec -e SQLCMDPASSWORD="$(mssql_password)" "$MSSQL_CONTAINER" \
-    /opt/mssql-tools18/bin/sqlcmd -S localhost -U "$MSSQL_USER" -C -b \
-    -Q "BACKUP DATABASE [${MSSQL_DATABASE}] TO DISK = N'${CONTAINER_BAK_PATH}' WITH INIT, STATS = 10;" \
-    || die "BACKUP DATABASE failed for ${MSSQL_DATABASE}"
-
-  log INFO "Copying backup file out of container"
-  docker cp "${MSSQL_CONTAINER}:${CONTAINER_BAK_PATH}" "$LOCAL_BAK_PATH" \
-    || die "docker cp failed for ${CONTAINER_BAK_PATH}"
-
-  docker exec "$MSSQL_CONTAINER" rm -f "$CONTAINER_BAK_PATH" \
-    || log WARN "Could not clean up ${CONTAINER_BAK_PATH} inside the container"
-
-  log INFO "Compressing backup"
-  gzip "$LOCAL_BAK_PATH" || die "gzip failed for ${LOCAL_BAK_PATH}"
-  sha256_sidecar "$OUTFILE"
+  # .bacpac is already a compressed package, so no gzip step here (unlike a
+  # raw native .bak, gzip'ing it further buys almost nothing).
+  sha256_sidecar "${OUTFILE}"
 
   upload_to_tier() {
     local tier="$1"

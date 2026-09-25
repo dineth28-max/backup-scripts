@@ -1,4 +1,5 @@
 config/backup.env
+config/
 logs/*.log
 
 # OS / editor cruft
