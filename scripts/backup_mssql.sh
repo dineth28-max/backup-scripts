@@ -57,35 +57,18 @@ else
   # raw native .bak, gzip'ing it further buys almost nothing).
   sha256_sidecar "${OUTFILE}"
 
-  upload_to_tier() {
-    local tier="$1"
-    local dest_prefix="${tier}/${STAMP}"
-    gcs_upload "$OUTFILE" "${dest_prefix}/$(basename "$OUTFILE")"
-    gcs_upload "${OUTFILE}.sha256" "${dest_prefix}/$(basename "$OUTFILE").sha256"
-  }
-
   log INFO "Uploading to daily/"
-  upload_to_tier "daily"
-
-  if [[ "$(date +%u)" -eq 7 ]]; then
-    log INFO "Sunday — also uploading to weekly/"
-    upload_to_tier "weekly"
-  fi
-
-  if [[ "$((10#$(date +%d)))" -eq 1 ]]; then
-    log INFO "1st of the month — also uploading to monthly/"
-    upload_to_tier "monthly"
-  fi
+  dest_prefix="daily/${STAMP}"
+  gcs_upload "$OUTFILE" "${dest_prefix}/$(basename "$OUTFILE")"
+  gcs_upload "${OUTFILE}.sha256" "${dest_prefix}/$(basename "$OUTFILE").sha256"
 fi
 
 log INFO "Cleaning local staging dir"
 rm -rf "$WORKDIR"
 
 if [[ "$DRY_RUN" -eq 0 ]]; then
-  log INFO "Pruning daily/ older than ${DAILY_RETENTION_DAYS}d, weekly/ older than ${WEEKLY_RETENTION_DAYS}d, monthly/ older than ${MONTHLY_RETENTION_DAYS}d"
+  log INFO "Pruning daily/ older than ${DAILY_RETENTION_DAYS}d (keeps the last ${DAILY_RETENTION_DAYS} daily backups)"
   prune_gcs_prefix "daily" "$DAILY_RETENTION_DAYS"
-  prune_gcs_prefix "weekly" "$WEEKLY_RETENTION_DAYS"
-  prune_gcs_prefix "monthly" "$MONTHLY_RETENTION_DAYS"
 fi
 
 log INFO "=== backup_mssql.sh completed successfully ==="

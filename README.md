@@ -24,7 +24,7 @@ host) — the same way any SQL client would.
 ## Is this actually working correctly? (status as of last review)
 
 - **Export logic**: `sqlpackage /Action:Export` → sha256 sidecar → upload to
-  GCS with daily/weekly/monthly tiering — verified by reading the script
+  GCS `daily/`, rolling 3-day retention — verified by reading the script
   end-to-end, internally consistent.
 - A real run against the container previously failed on a TLS/certificate
   error (`sqlcmd`'s ODBC Driver 18 refusing the self-signed cert) when this
@@ -53,17 +53,15 @@ SQL Server (TCP, e.g. localhost:13727)
    GCS
 ```
 
-One cron job, once a day: export the database to a `.bacpac`, upload to GCS.
-The same day's export is also copied into a `weekly/` folder on Sundays and a
-`monthly/` folder on the 1st of the month, giving three retention tiers from
-one export run (grandfather-father-son rotation) — no extra load on SQL
-Server to produce the weekly/monthly copies.
+One cron job, once a day: export the database to a `.bacpac`, upload to
+`daily/` in GCS. **Daily only, no weekly/monthly tiers** — a simple rolling
+window of the last 3 days. When the 4th day's backup uploads, the pruning
+step deletes anything older than `DAILY_RETENTION_DAYS`, so the oldest
+(now 4th-oldest) backup is removed and exactly 3 remain.
 
-| Tier    | Taken            | Kept for  |
-|---------|-------------------|-----------|
-| Daily   | every day         | 14 days   |
-| Weekly  | every Sunday      | 8 weeks   |
-| Monthly | 1st of the month  | 12 months |
+| Tier  | Taken      | Kept for |
+|-------|------------|----------|
+| Daily | every day  | 3 days   |
 
 **Important trade-off vs. a native `.bak` backup**: a `.bacpac` is a logical
 export (schema + data via `INSERT`-style bulk copy) — it does **not** capture
@@ -142,8 +140,8 @@ tail -f Backupscripting/logs/cron_test.log
 ```
 gs://db_backups_antler/mssql-dev/
   daily/2026-09-25_020000/<BACKUP_NAME_PREFIX>_2026-09-25_020000.bacpac(.sha256)
-  weekly/2026-09-20_020000/...   (same file, copied on Sundays)
-  monthly/2026-09-01_020000/...  (same file, copied on the 1st)
+  daily/2026-09-26_020000/...
+  daily/2026-09-27_020000/...   (only the last 3 days' worth exist at any time)
 ```
 
 `BACKUP_NAME_PREFIX` (set in `config/backup.env`) identifies which host/container
@@ -153,14 +151,13 @@ Every object gets a `.sha256` sidecar alongside it.
 
 ## 5. Retention
 
-Enforced by `backup_mssql.sh` itself after every run (deletes objects older
-than the configured window in each tier — `DAILY_RETENTION_DAYS=14`,
-`WEEKLY_RETENTION_DAYS=56`, `MONTHLY_RETENTION_DAYS=365` in `backup.env`).
+Enforced by `backup_mssql.sh` itself after every run — deletes `daily/`
+objects older than `DAILY_RETENTION_DAYS` (set to `3` in `backup.env`), so
+only the last 3 days' backups ever exist at once.
 
 Belt-and-suspenders: also set a GCS **Object Lifecycle Management** rule on
-the bucket (`daily/` → delete after 14d, `weekly/` → 56d, `monthly/` → 365d,
-matched by object name prefix) so retention still happens even if a cron run
-silently stops working.
+the bucket (`daily/` → delete after 3d, matched by object name prefix) so
+retention still happens even if a cron run silently stops working.
 
 ## 6. Notes / open items
 
@@ -187,7 +184,7 @@ Backupscripting/
 ├── config/backup.env.example    dummy config — copy to backup.env, fill in real values
 ├── lib/common.sh                shared logging / GCS / locking helpers
 ├── scripts/
-│   ├── backup_mssql.sh          sqlpackage export -> GCS (daily/weekly/monthly)
+│   ├── backup_mssql.sh          sqlpackage export -> GCS daily/ (rolling 3-day retention)
 │   └── install_cron.sh          merges cron/crontab.txt into the user's crontab
 ├── cron/crontab.txt              schedule template (one daily job)
 └── logs/                        cron.log + per-script daily logs land here

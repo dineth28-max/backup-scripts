@@ -4,7 +4,7 @@
 # (merges these lines into the current user's crontab instead of overwriting it)
 #
 # One daily job does everything: sqlpackage export (.bacpac) -> upload -> GCS
-# daily/, and also copies into weekly/ on Sundays and monthly/ on the 1st —
+# daily/ -> prune anything older than 3 days, keeping a rolling 3-day window —
 # see backup_mssql.sh.
 
 # Daily backup — every day at 02:00
