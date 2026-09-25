@@ -24,11 +24,7 @@ DRY_RUN=0
 acquire_lock
 log INFO "=== backup_mssql.sh starting (db=${MSSQL_DATABASE}, dry_run=${DRY_RUN}) ==="
 
-# Reads the sa password from a file. Note: unlike sqlcmd's SQLCMDPASSWORD env
-# var, SqlPackage has no equivalent env-var pickup for /SourcePassword — it
-# has to be passed as a CLI arg below, which is visible to other local users
-# via `ps` for the duration of the export. Restrict shell access to this host
-# accordingly; this is a real limitation of the SqlPackage CLI, not a bug here.
+
 mssql_password() {
   [[ -f "$MSSQL_PASSWORD_FILE" ]] || die "MSSQL_PASSWORD_FILE not found: $MSSQL_PASSWORD_FILE"
   cat "$MSSQL_PASSWORD_FILE"
