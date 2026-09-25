@@ -1,0 +1,11 @@
+# SQL Server (dev) — Database Backup Schedule
+#
+# Installed with: ./scripts/install_cron.sh
+# (merges these lines into the current user's crontab instead of overwriting it)
+#
+# One daily job does everything: BACKUP DATABASE -> gzip -> upload -> GCS
+# daily/, and also copies into weekly/ on Sundays and monthly/ on the 1st —
+# see backup_mssql.sh.
+
+# Daily backup — every day at 02:00
+0 2 * * * __BACKUP_DIR__/scripts/backup_mssql.sh >> __BACKUP_DIR__/logs/cron.log 2>&1
