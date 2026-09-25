@@ -43,8 +43,11 @@ else
 
   # SQLCMDPASSWORD env var (not -P on the command line) keeps the password
   # out of argv, same rationale as the file-based read above.
+  # -C: trust the server's self-signed cert (ODBC Driver 18 defaults to
+  #     Encrypt=Mandatory + cert validation, which a self-signed cert fails).
+  # -b: exit non-zero on a T-SQL error inside -Q, not just on connection failure.
   docker exec -e SQLCMDPASSWORD="$(mssql_password)" "$MSSQL_CONTAINER" \
-    /opt/mssql-tools18/bin/sqlcmd -S localhost -U "$MSSQL_USER" \
+    /opt/mssql-tools18/bin/sqlcmd -S localhost -U "$MSSQL_USER" -C -b \
     -Q "BACKUP DATABASE [${MSSQL_DATABASE}] TO DISK = N'${CONTAINER_BAK_PATH}' WITH INIT, STATS = 10;" \
     || die "BACKUP DATABASE failed for ${MSSQL_DATABASE}"
 
