@@ -1,82 +1,64 @@
 # Antlerfoundry SQL Server Backup — Run Guide
 
-Assumes the SQL Server container, database, and GCS bucket are already up
-and provisioned. This is just how to run the backup script.
+Backs up every SQL Server defined as an `MSSQL_<n>_*` block in `config/backup.env`
+one after another to `gs://<GCS_BUCKET>/<GCS_PREFIX>/<container>/<stamp>/`,
+keeping 3 days per container. Runs at 02:00 from cron.
 
-Backs up as a **`.bacpac`** (schema + data, via SqlPackage) — connects
-directly to the SQL Server TCP endpoint, no `docker exec` needed for the
-export itself.
-
-## 0. One-time: install SqlPackage on the host
+## 0. One-time
 
 ```bash
+# SqlPackage
 curl -L -o /tmp/sqlpackage.zip https://aka.ms/sqlpackage-linux
-sudo mkdir -p /opt/sqlpackage
-sudo unzip /tmp/sqlpackage.zip -d /opt/sqlpackage
-sudo chmod +x /opt/sqlpackage/sqlpackage
-sudo ln -s /opt/sqlpackage/sqlpackage /usr/local/bin/sqlpackage
-sqlpackage /version
+sudo mkdir -p /opt/sqlpackage && sudo unzip /tmp/sqlpackage.zip -d /opt/sqlpackage
+sudo chmod +x /opt/sqlpackage/sqlpackage && sudo ln -s /opt/sqlpackage/sqlpackage /usr/local/bin/sqlpackage
+
+# Config + per-container password files
+cp config/backup.env.example config/backup.env
+./scripts/discover_instances.sh --write-secrets /opt/antlerfoundry/secrets/mssql
+ls -l /opt/antlerfoundry/secrets/mssql/      # one <container>.password per instance, mode 600
 ```
 
-## 1. Confirm `config/backup.env` is filled in
+Check every `MSSQL_<n>_*` block in `config/backup.env` (the helper prints
+ready-made blocks you can paste). Each needs CONTAINER, HOST, PORT, USER,
+PASSWORD_FILE and DATABASE.
 
-```
-GCP_PROJECT_ID=<your real GCP project id>
-MSSQL_HOST=localhost
-MSSQL_PORT=13727
-MSSQL_DATABASE=<the real database name>
-MSSQL_PASSWORD_FILE=/opt/antlerfoundry/secrets/mssql_sa_password
-BACKUP_NAME_PREFIX=<e.g. ovh_ms-sql-server-dev-antlerhrmdfc>
-```
-
-**`MSSQL_PASSWORD_FILE` must be a path to a file, not the password itself.**
-That file and the GCS key file must already exist on the host:
+## 1. Dry run
 
 ```bash
-cat /opt/antlerfoundry/secrets/mssql_sa_password       # should print the sa password, nothing else
-cat /opt/antlerfoundry/secrets/gcs_service_account.json  # should be a JSON key file
-```
-
-## 2. Dry run
-
-```bash
-cd /path/to/Backupscripting
 ./scripts/backup_mssql.sh --dry-run
 ```
 
-Checks config, GCP auth, and the lock file — does not touch SQL Server or
-upload anything (does not prove `sqlpackage` or the `sa` credentials work).
+Checks GCP auth, every password file, and logs into every container to list
+its databases. Does not export or upload anything.
 
-## 3. Real run
-
-```bash
-./scripts/backup_mssql.sh
-```
-
-Verify it landed:
+## 2. Real run
 
 ```bash
-gcloud storage ls -l gs://db_backups_antler/mssql-test/daily/
+./scripts/backup_mssql.sh --only ms-sql-server-dev-antlerhrmdfc   # one instance first
+./scripts/backup_mssql.sh                                         # then all
+gcloud storage ls -r gs://db_backups_antler/ovh-vps-4a559a55/
 ```
 
-(use whatever `GCS_PREFIX` is actually set to in your `backup.env`)
-
-## 4. Schedule it (cron)
+## 3. Schedule
 
 ```bash
 ./scripts/install_cron.sh
-crontab -l   # confirm the mssql-backup block is present
+crontab -l
 ```
-
-Runs daily at 02:00 from then on.
 
 ## Troubleshooting
 
+Logs: `$LOG_DIR/backup_mssql_<date>.log` (includes sqlpackage's own output) and `logs/cron.log`.
+
 | Symptom | Likely cause |
 |---|---|
-| `MSSQL_PASSWORD_FILE not found: ...` | That field has the password itself instead of a file path, or the file doesn't exist yet |
-| `GOOGLE_APPLICATION_CREDENTIALS file not found` | Wrong path in `backup.env`, or key file missing |
-| `Failed to activate GCP service account credentials` | Key file invalid/revoked, or wrong `GCP_PROJECT_ID` |
-| `SqlPackage export failed for <db>` | Wrong `MSSQL_DATABASE`/`MSSQL_HOST`/`MSSQL_PORT`, `sa` auth failed, or `sqlpackage` not installed |
-| `SSL routines:tls_process_server_certificate` | Should already be fixed via `/SourceTrustServerCertificate:True` — if it recurs, check the flag is still in the script |
-| `Another backup run is already holding ...` | A previous run is still in progress or crashed mid-run holding the lock |
+| `[<name>] incomplete block <n>` | That `MSSQL_<n>_*` block is missing the fields listed |
+| `[<name>] password file not found` | `MSSQL_<n>_PASSWORD_FILE` points to a file that doesn't exist |
+| `backup.env: line N: ...: command not found` | A value with a space in it (e.g. `DbA, DbB`) — remove the space or quote it |
+| `[<name>] could not list databases` | Wrong password in the file, container stopped, or name typo |
+| `[<name>] no sqlcmd found inside the container` | Container not running, or an image without mssql-tools — set `MSSQL_<n>_DATABASE` to real names instead of `*` |
+| `SqlPackage export failed for <db>` | Wrong `MSSQL_<n>_HOST`/`PORT`/`DATABASE`, auth failed, or export timed out (`EXPORT_TIMEOUT`) — see the log |
+| `skipping retention prune` | Expected after a failure: older backups for that container are kept |
+| `GOOGLE_APPLICATION_CREDENTIALS file not found` / `Failed to activate` | Key path wrong or key revoked |
+| `Another backup run is already holding ...` | Previous run still going (16 instances in a queue can take a while) |
+| `sqlpackage not found on PATH` | Cron's PATH lacks `/usr/local/bin` — check the symlink from step 0 |

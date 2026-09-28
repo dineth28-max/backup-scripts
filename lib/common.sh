@@ -3,11 +3,21 @@
 
 set -euo pipefail
 
+# cron runs with PATH=/usr/bin:/bin, which misses sqlpackage (/usr/local/bin)
+# and a snap-installed gcloud (/snap/bin).
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:${PATH:-}"
+
 BACKUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${BACKUP_ROOT}/config/backup.env"
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "FATAL: ${ENV_FILE} not found. Copy config/backup.env.example to config/backup.env and fill it in." >&2
+  exit 1
+fi
+# A backup.env saved with Windows (CRLF) line endings would put a hidden \r
+# on the end of every value (bucket, paths ...) and break everything subtly.
+if grep -q $'\r' "$ENV_FILE"; then
+  echo "FATAL: ${ENV_FILE} has Windows (CRLF) line endings. Fix with: sed -i 's/\r\$//' ${ENV_FILE}" >&2
   exit 1
 fi
 # shellcheck disable=SC1090
@@ -17,8 +27,17 @@ set -a; source "$ENV_FILE"; set +a
 : "${GCS_PREFIX:?missing in backup.env}"
 : "${GCP_PROJECT_ID:?missing in backup.env}"
 : "${GOOGLE_APPLICATION_CREDENTIALS:?missing in backup.env}"
+: "${LOG_DIR:?missing in backup.env}"
+: "${BACKUP_TMP_DIR:?missing in backup.env}"
+: "${LOCK_FILE:?missing in backup.env}"
 
 export GOOGLE_APPLICATION_CREDENTIALS
+# Private gcloud config for this script, so activating the backup service
+# account doesn't switch the active gcloud account for anything else the
+# user runs on this host.
+export CLOUDSDK_CONFIG="${BACKUP_ROOT}/.gcloud"
+mkdir -p "$CLOUDSDK_CONFIG"
+chmod 700 "$CLOUDSDK_CONFIG"
 
 mkdir -p "$LOG_DIR" "$BACKUP_TMP_DIR"
 
@@ -62,10 +81,14 @@ acquire_lock() {
   fi
 }
 
+# Returns non-zero on failure instead of dying, so one failed instance does
+# not stop the rest of the queue.
 gcs_upload() {
   local src="$1" dest="gs://${GCS_BUCKET}/${GCS_PREFIX}/$2"
-  gcloud storage cp "$src" "$dest" --quiet \
-    || die "GCS upload failed: $src -> $dest"
+  if ! gcloud storage cp "$src" "$dest" --quiet; then
+    log ERROR "GCS upload failed: $src -> $dest"
+    return 1
+  fi
   log INFO "Uploaded $src -> $dest"
 }
 
@@ -76,19 +99,27 @@ sha256_sidecar() {
   ( cd "$(dirname "$file")" && sha256sum "$(basename "$file")" ) > "${file}.sha256"
 }
 
-# Deletes GCS objects under a prefix whose last-modified date is older than N days.
-prune_gcs_prefix() {
-  local prefix="$1" days="$2"
-  local cutoff
-  cutoff="$(date -d "-${days} days" +%F 2>/dev/null || date -v-"${days}"d +%F)"
-  # `-l` prints "<size>  <RFC3339 timestamp>  <gs:// url>" per object plus a
-  # trailing "TOTAL: ..." summary line, which the grep -v drops.
-  gcloud storage ls -l "gs://${GCS_BUCKET}/${GCS_PREFIX}/${prefix}/**" 2>/dev/null \
-    | grep -v '^TOTAL:' \
-    | awk -v cutoff="$cutoff" 'substr($2,1,10) < cutoff {print $3}' \
-    | while read -r url; do
-      [[ -n "$url" ]] || continue
-      log INFO "Deleting expired object (older than ${days}d): ${url}"
-      gcloud storage rm "$url" --quiet || log WARN "Failed to delete ${url}"
-    done
+# Keeps the newest N days of backup folders under ${GCS_PREFIX}/<folder>/.
+# Folders are named <YYYY-MM-DD_HHMMSS>, so the date is read from the folder
+# name (same clock as the backup stamp) rather than from GCS object times.
+# With N=3, a run on the 4th day deletes the 1st day's folder: 3 days remain.
+# The cutoff is counted from the run's own date (<ref_date>, YYYY-MM-DD), not
+# from "now", so a long run that crosses midnight still keeps exactly N days.
+prune_gcs_folder() {
+  local folder="$1" days="$2" ref_date="$3"
+  local cutoff listing url stamp
+  cutoff="$(date -d "${ref_date} -$(( days - 1 )) days" +%F)"
+  if ! listing="$(gcloud storage ls "gs://${GCS_BUCKET}/${GCS_PREFIX}/${folder}/" 2>>"$LOG_FILE")"; then
+    log WARN "[${folder}] could not list gs://${GCS_BUCKET}/${GCS_PREFIX}/${folder}/ — retention prune skipped (does the service account have storage.objects.list?)"
+    return 0
+  fi
+  while read -r url; do
+    [[ "$url" == */ ]] || continue
+    stamp="$(basename "$url")"
+    [[ "$stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}_ ]] || continue
+    if [[ "${stamp:0:10}" < "$cutoff" ]]; then
+      log INFO "Deleting expired backup (older than ${days}d): ${url}"
+      gcloud storage rm -r "$url" --quiet || log WARN "Failed to delete ${url} (does the service account have storage.objects.delete?)"
+    fi
+  done <<< "$listing"
 }

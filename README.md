@@ -1,82 +1,108 @@
-# Antlerfoundry SQL Server (dev) — Database Backup
+# Antlerfoundry SQL Server — Database Backup (all systems on one host)
 
-Backup tooling for the Antlerfoundry SQL Server 2019 database running in its
-own Docker container. Runs from cron on the host that container runs on,
-ships everything to Google Cloud Storage. Exports a **`.bacpac`** (schema +
-data) via SqlPackage, connecting directly to the SQL Server TCP endpoint —
-no `docker exec`/`docker cp` involved.
+One host (OVH `vps-4a559a55`) runs many AntlerHRM systems, each with its own
+SQL Server container (`ms-sql-server-dev-antlerhrm*`, `middleware-sqlserver`),
+published on its own host port. This repo backs up **all of them** from one
+cron job to Google Cloud Storage as **`.bacpac`** exports (schema + data, via
+SqlPackage).
 
 **Backup-only** — there is intentionally no restore script in this repo.
 
-There is no "Vertical Platform" / Postgres system here — that was a different,
-now-removed project. Everything in this repo backs up exactly one thing: the
-Antlerfoundry SQL Server database below.
-
-## 1. What's being backed up
-
-One database, named by `MSSQL_DATABASE` in `config/backup.env`, inside the
-`ms-sql-server-dev-antlerhrmdfc` container (image
-`mcr.microsoft.com/mssql/server:2019-latest`). Its port 1433 is mapped to
-`13727` on the host, and the backup script connects to
-`${MSSQL_HOST}:${MSSQL_PORT}` (i.e. `localhost:13727` when run on that same
-host) — the same way any SQL client would.
-
-## Is this actually working correctly? (status as of last review)
-
-- **Export logic**: `sqlpackage /Action:Export` → sha256 sidecar → upload to
-  GCS `daily/`, rolling 3-day retention — verified by reading the script
-  end-to-end, internally consistent.
-- A real run against the container previously failed on a TLS/certificate
-  error (`sqlcmd`'s ODBC Driver 18 refusing the self-signed cert) when this
-  used a native `BACKUP DATABASE` — that approach has since been replaced
-  entirely by the `.bacpac` export below. The TLS fix (`/SourceTrustServerCertificate:True`)
-  carries over to this version.
-- **Not yet proven by an actual run with SqlPackage**: nobody has executed
-  this version of `backup_mssql.sh` yet. Until that happens, "the script is
-  correct on paper" and "the script actually backs up this database" are not
-  the same claim.
-- **Before trusting it**: confirm `sqlpackage` is installed on the host
-  (section 3), fill in `config/backup.env`, then run `./scripts/backup_mssql.sh`
-  for real once and confirm the `.bacpac` + `.sha256` land in
-  `gs://db_backups_antler/mssql-dev/daily/`. That's the only way to turn
-  "should work" into "does work."
-
-## 2. Strategy
+## 1. Strategy
 
 ```
-SQL Server (TCP, e.g. localhost:13727)
-   │  sqlpackage /Action:Export (schema + data -> .bacpac)
-   ▼
- Upload
-   │
-   ▼
-   GCS
+02:00 cron ─► backup_mssql.sh
+                │  for each MSSQL_<n>_* block in backup.env (one at a time — a queue)
+                │    for each database in MSSQL_<n>_DATABASE (one at a time)
+                │      sqlpackage /Action:Export  -> local .bacpac (staging)
+                │      upload .bacpac + .sha256   -> GCS <container>/<stamp>/
+                │      delete local copy
+                │    prune that container's folder to the last 3 days
+                ▼
+               GCS
 ```
 
-One cron job, once a day: export the database to a `.bacpac`, upload to
-`daily/` in GCS. **Daily only, no weekly/monthly tiers** — a simple rolling
-window of the last 3 days. When the 4th day's backup uploads, the pruning
-step deletes anything older than `DAILY_RETENTION_DAYS`, so the oldest
-(now 4th-oldest) backup is removed and exactly 3 remain.
+- **Sequential, never parallel**: only one export runs at a time, so the host
+  (which also serves every system) is never hit by 16 exports at once, and
+  local disk only ever holds one `.bacpac`.
+- **One failure doesn't stop the queue**: a failed instance is logged and the
+  script moves on to the next. At the end it exits non-zero and sends an
+  alert (if `ALERT_EMAIL` is set) listing the failed instances.
+- **Databases come from `.env`**: `MSSQL_<n>_DATABASE` names them
+  (`antler`, or `DbA,DbB`). `*` instead lists every online user database by
+  running `sqlcmd` inside that container.
+- **Retention: 3 days per container.** After a container's backup succeeds,
+  its date folders older than `DAILY_RETENTION_DAYS` are deleted — a 4th
+  day's run removes the 1st day, so 3 remain. **If a container's backup
+  failed, its folder is not pruned**, so good older backups are never
+  deleted while new ones aren't landing.
 
-| Tier  | Taken      | Kept for |
-|-------|------------|----------|
-| Daily | every day  | 3 days   |
+### GCS layout (bucket `db_backups_antler`)
 
-**Important trade-off vs. a native `.bak` backup**: a `.bacpac` is a logical
-export (schema + data via `INSERT`-style bulk copy) — it does **not** capture
-server-level logins, some SQL Server-specific features, or the transaction
-log, and it's slower to produce/restore on larger databases. It's more
-portable (works across SQL Server versions/editions, even into Azure SQL) but
-is not a substitute for a true point-in-time disaster-recovery backup. This
-was chosen because it's specifically what was asked for — revisit if this
-database grows large enough that export time or feature coverage becomes a
-problem.
+```
+gs://db_backups_antler/<GCS_PREFIX>/                      e.g. ovh-vps-4a559a55/
+  ms-sql-server-dev-antlerhrmdfc/
+    2026-09-25_020001/<db>_2026-09-25_020001.bacpac(.sha256)
+    2026-09-26_020003/...
+    2026-09-27_020002/...        (only the last 3 days exist)
+  ms-sql-server-dev-antlerhrmwti/
+    ...
+  middleware-sqlserver/
+    ...
+```
 
-## 3. Setup
+**`.bacpac` trade-off**: a logical export (schema + data). It does not capture
+server logins, the transaction log, or point-in-time recovery, and is slower
+than a native `.bak` on large databases. Portable across SQL Server versions.
 
-**Install SqlPackage on the host** (this is new — it wasn't required by the
-old `sqlcmd`-based approach):
+## 2. Configuration — only `config/backup.env` changes between servers
+
+The scripts are identical on every server. `config/backup.env` (copy of
+`config/backup.env.example`, gitignored) decides **how many SQL Servers** are
+backed up and **which databases**. Each SQL Server is one numbered block with
+its full connection details:
+
+```bash
+# --- SQL Server 1 ---
+MSSQL_1_CONTAINER=ms-sql-server-dev-antlerhrmdfc     # docker container = GCS folder name
+MSSQL_1_HOST=localhost
+MSSQL_1_PORT=13727
+MSSQL_1_USER=sa
+MSSQL_1_PASSWORD_FILE=/opt/antlerfoundry/secrets/mssql_password
+MSSQL_1_DATABASE=antler                              # or DbA,DbB  or * (all user DBs)
+
+# --- SQL Server 2 ---
+MSSQL_2_CONTAINER=...
+```
+
+The script finds every `MSSQL_<n>_CONTAINER`, sorts by `<n>`, and runs them
+as a queue. A server with 2 SQL Servers has blocks 1–2; one with 6 has 1–6.
+To add a server, add the next block; to skip one, comment out its block.
+If a block is missing a field, that server is reported as failed and the
+others still run.
+
+Rules: `PASSWORD_FILE` is a **path to a file** containing only the password,
+never the password itself. Values can't contain spaces (`DbA,DbB`, not
+`DbA, DbB`) unless wrapped in quotes. `DATABASE=*` lists databases with
+`sqlcmd` inside the container, so it needs `CONTAINER` to match `docker ps`.
+
+Other settings:
+
+| Setting | What it does |
+|---|---|
+| `GCP_PROJECT_ID`, `GCS_BUCKET`, `GOOGLE_APPLICATION_CREDENTIALS` | Where backups go / service-account key file |
+| `GCS_PREFIX` | Top-level folder for this server in the bucket |
+| `BACKUP_CRON_SCHEDULE` | Cron time, **server timezone** (`"0 2 * * *"`). Re-run `install_cron.sh` after changing |
+| `EXPORT_TIMEOUT` | Max time per database export (default `6h`; force-killed 5 min later if it won't stop) |
+| `MIN_FREE_GB` | Skip an export if the staging disk has less free space than this (default `20`) |
+| `BACKUP_TMP_DIR`, `LOG_DIR`, `LOCK_FILE` | Local staging / logs / lock |
+| `LOG_RETENTION_DAYS` | Daily log files older than this are deleted (default `30`) |
+| `DAILY_RETENTION_DAYS` | Days kept per SQL Server (`3`) |
+| `ALERT_EMAIL` | Optional; needs `mail` installed on the host |
+
+## 3. Setup (on the host)
+
+**Install SqlPackage:**
 
 ```bash
 curl -L -o /tmp/sqlpackage.zip https://aka.ms/sqlpackage-linux
@@ -84,108 +110,85 @@ sudo mkdir -p /opt/sqlpackage
 sudo unzip /tmp/sqlpackage.zip -d /opt/sqlpackage
 sudo chmod +x /opt/sqlpackage/sqlpackage
 sudo ln -s /opt/sqlpackage/sqlpackage /usr/local/bin/sqlpackage
-sqlpackage /version   # confirm it runs (requires the .NET runtime — the
-                       # installer will tell you if that's missing)
+sqlpackage /version
 ```
 
-Then the usual config:
+**Config + secrets:**
 
 ```bash
 cd Backupscripting
-cp config/backup.env.example config/backup.env
-# edit config/backup.env: real GCP_PROJECT_ID, GCS_BUCKET, MSSQL_DATABASE,
-# MSSQL_HOST/MSSQL_PORT, BACKUP_NAME_PREFIX, paths for your host
+cp config/backup.env.example config/backup.env    # then edit
 
-mkdir -p /opt/antlerfoundry/secrets
-echo -n 'the real sa password' > /opt/antlerfoundry/secrets/mssql_sa_password
-chmod 600 /opt/antlerfoundry/secrets/mssql_sa_password
-
-# service account needs Storage Object Admin (or equivalent) on the bucket
-gcloud iam service-accounts keys create /opt/antlerfoundry/secrets/gcs_service_account.json \
-  --iam-account=mssql-backup@your-gcp-project-id.iam.gserviceaccount.com
-chmod 600 /opt/antlerfoundry/secrets/gcs_service_account.json
+# Optional helper: prints an MSSQL_<n>_* block for every SQL container running
+# here, and writes one password file per container from its
+# MSSQL_SA_PASSWORD / SA_PASSWORD env var (existing files never overwritten).
+./scripts/discover_instances.sh --write-secrets /opt/antlerfoundry/secrets/mssql
 ```
 
-`config/backup.env` and the credential files are gitignored — never commit
-real secrets. The example file ships with a **placeholder** project/bucket.
-**`MSSQL_PASSWORD_FILE` must be a path to a file containing the password —
-never the password itself.**
+If an `sa` password was changed after its container was created, the env
+var is stale — fix that container's `.password` file by hand. Each file must
+contain only the password.
 
-Test by hand before trusting cron with it:
+The user running cron must be able to run `docker` (it's in the `docker`
+group on this host) and read the secrets directory.
+
+The GCP service account needs **`roles/storage.objectAdmin`** on the bucket
+(create + list + delete). With only `objectCreator`, uploads work but the
+3-day prune can't list/delete, so old backups pile up (logged as `WARN`).
+
+git stores the scripts without the execute bit; run them with `bash`
+(e.g. `bash scripts/backup_mssql.sh --dry-run`) or `chmod +x scripts/*.sh`
+once. The cron line already calls `/bin/bash` explicitly.
+
+**Test by hand before trusting cron:**
 
 ```bash
-./scripts/backup_mssql.sh --dry-run
-./scripts/backup_mssql.sh          # real run — check logs/ and the GCS bucket
+./scripts/backup_mssql.sh --dry-run                                  # checks GCP auth, passwords, lists every DB — exports nothing
+./scripts/backup_mssql.sh --only ms-sql-server-dev-antlerhrmdfc      # real backup of one instance
+./scripts/backup_mssql.sh                                             # full real run
 ```
 
-Install the daily cron job (merges into the existing crontab, doesn't
-overwrite it):
+**Install the cron job** (merges into the existing crontab). Cron uses the
+server's timezone — check it first, and set `BACKUP_CRON_SCHEDULE` so the
+run happens at night local time (on a UTC server, 02:00 Sri Lanka time is
+`"30 20 * * *"`):
 
 ```bash
+timedatectl | grep 'Time zone'
 ./scripts/install_cron.sh
-crontab -l   # confirm the mssql-backup block is present
+crontab -l
 ```
 
-Then **prove cron itself actually fires** — don't just trust the schedule:
+gcloud runs with its own config dir (`Backupscripting/.gcloud/`), so the
+script never changes the active gcloud account for anything else on the host.
 
-```bash
-# run once a minute temporarily to confirm cron is invoking the script at all
-crontab -e   # add: * * * * * /path/to/Backupscripting/scripts/backup_mssql.sh --dry-run >> /path/to/Backupscripting/logs/cron_test.log 2>&1
-tail -f Backupscripting/logs/cron_test.log
-# once confirmed, remove the test line — the real 02:00 schedule from install_cron.sh stays
-```
+## 4. Notes
 
-## 4. GCS layout (bucket: `db_backups_antler`)
+- Restoring = download the `.bacpac`, verify with `sha256sum -c`, then
+  `sqlpackage /Action:Import` into a target server. Not scripted here.
+- `/SourcePassword` is passed to `sqlpackage` on the command line (it has no
+  env-var alternative), so it's visible in `ps` during that export. Database
+  discovery passes the password via the environment instead.
+- A full run backs up 16 instances one by one — check `logs/` after the first
+  night to see how long it takes and make sure it finishes well before the
+  working day.
+- Belt-and-braces: a GCS lifecycle rule (delete objects under `<GCS_PREFIX>/`
+  older than ~7 days) catches anything left behind if cron silently stops.
+  Keep it longer than 3 days so it never beats the script's own retention.
+- Old single-instance backups under `gs://db_backups_antler/mssql-test/` are
+  not touched by this script — delete them manually when no longer needed.
 
-```
-gs://db_backups_antler/mssql-dev/
-  daily/2026-09-25_020000/<BACKUP_NAME_PREFIX>_2026-09-25_020000.bacpac(.sha256)
-  daily/2026-09-26_020000/...
-  daily/2026-09-27_020000/...   (only the last 3 days' worth exist at any time)
-```
-
-`BACKUP_NAME_PREFIX` (set in `config/backup.env`) identifies which host/container
-the backup came from, e.g. `ovh_ms-sql-server-dev-antlerhrmdfc`.
-
-Every object gets a `.sha256` sidecar alongside it.
-
-## 5. Retention
-
-Enforced by `backup_mssql.sh` itself after every run — deletes `daily/`
-objects older than `DAILY_RETENTION_DAYS` (set to `3` in `backup.env`), so
-only the last 3 days' backups ever exist at once.
-
-Belt-and-suspenders: also set a GCS **Object Lifecycle Management** rule on
-the bucket (`daily/` → delete after 3d, matched by object name prefix) so
-retention still happens even if a cron run silently stops working.
-
-## 6. Notes / open items
-
-- **Backup-only.** Restoring means downloading the `.bacpac` and running
-  `sqlpackage /Action:Import` against a target SQL Server — there's no
-  scripted path for that here.
-- **Password exposure via `ps`**: SqlPackage has no environment-variable
-  equivalent to `sqlcmd`'s `SQLCMDPASSWORD`, so `/SourcePassword` is passed
-  as a CLI argument to `sqlpackage`, which other local users on the host
-  could see via `ps` for the duration of the export. Restrict shell access
-  to this host accordingly.
-- **`.bacpac` vs `.bak` trade-off** — see section 2. Not a full
-  disaster-recovery backup; a schema+data export.
-- `--dry-run` skips the actual SqlPackage export and the GCS upload, so it
-  only proves the config/lock/logging plumbing and GCP auth work — it does
-  not prove `sqlpackage` is installed, or that the `sa` credentials / network
-  path to SQL Server are correct. Do one real run before trusting cron with it.
-
-## 7. Files
+## 5. Files
 
 ```
 Backupscripting/
-├── README.md                    this file
-├── config/backup.env.example    dummy config — copy to backup.env, fill in real values
-├── lib/common.sh                shared logging / GCS / locking helpers
+├── README.md / RUNBOOK.md
+├── config/backup.env.example     template — copy to backup.env
+├── lib/common.sh                 logging / GCS / lock / retention helpers
 ├── scripts/
-│   ├── backup_mssql.sh          sqlpackage export -> GCS daily/ (rolling 3-day retention)
-│   └── install_cron.sh          merges cron/crontab.txt into the user's crontab
-├── cron/crontab.txt              schedule template (one daily job)
-└── logs/                        cron.log + per-script daily logs land here
+│   ├── backup_mssql.sh           the queue: every MSSQL_<n> block -> GCS, 3-day retention
+│   ├── discover_instances.sh     prints MSSQL_<n>_* blocks from `docker ps`, writes password files
+│   └── install_cron.sh           merges cron/crontab.txt into the user's crontab
+├── cron/crontab.txt              02:00 daily
+└── logs/
 ```

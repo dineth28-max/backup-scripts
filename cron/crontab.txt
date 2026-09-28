@@ -1,11 +1,15 @@
-# SQL Server (dev) — Database Backup Schedule
+# SQL Server — Database Backup Schedule (all containers on this host)
 #
 # Installed with: ./scripts/install_cron.sh
 # (merges these lines into the current user's crontab instead of overwriting it)
 #
-# One daily job does everything: sqlpackage export (.bacpac) -> upload -> GCS
-# daily/ -> prune anything older than 3 days, keeping a rolling 3-day window —
-# see backup_mssql.sh.
+# One daily job does everything: for each MSSQL_<n>_* block
+# (config/backup.env), one after another: sqlpackage export (.bacpac) ->
+# upload to GCS <GCS_PREFIX>/<container>/<stamp>/ -> prune that container's
+# folder to the last 3 days. See backup_mssql.sh.
 
-# Daily backup — every day at 02:00
-0 2 * * * __BACKUP_DIR__/scripts/backup_mssql.sh >> __BACKUP_DIR__/logs/cron.log 2>&1
+# Daily backup — time comes from BACKUP_CRON_SCHEDULE in backup.env
+# (server timezone). Re-run install_cron.sh after changing it.
+# Run through /bin/bash so a missing execute bit (git stores these scripts
+# as 644) can't make cron fail with "Permission denied".
+__SCHEDULE__ /bin/bash __BACKUP_DIR__/scripts/backup_mssql.sh >> __BACKUP_DIR__/logs/cron.log 2>&1

@@ -1,8 +1,9 @@
-config/backup.env
-config/
+config/*
+!config/backup.env.example
 logs/*.log
 
 # OS / editor cruft
 .DS_Store
 Thumbs.db
 *.swp
+.gcloud/
