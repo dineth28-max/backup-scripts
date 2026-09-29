@@ -112,20 +112,25 @@ backup_database() {
   fi
 
   log INFO "[${name}] exporting ${db} -> ${outfile} (${free_gb} GB free)"
-  # sqlpackage's own (verbose) output goes to the log file only. -k: if it
-  # ignores the timeout's SIGTERM, SIGKILL it 5 minutes later so the queue
-  # can never hang.
+  # sqlpackage's own (verbose) output always goes to the log file; when run by
+  # hand from a terminal it is also shown live, so a long export visibly makes
+  # progress (under cron it stays out of cron.log). -k: if it ignores the
+  # timeout's SIGTERM, SIGKILL it 5 minutes later so the queue can never hang.
+  local live=/dev/null started=$SECONDS
+  [[ -t 2 ]] && live=/dev/stderr
   if ! timeout -k 5m "$EXPORT_TIMEOUT" sqlpackage /Action:Export \
       /SourceServerName:"${host},${port}" \
       /SourceDatabaseName:"${db}" \
       /SourceUser:"${user}" \
       /SourcePassword:"${pw}" \
       /SourceTrustServerCertificate:True \
-      /TargetFile:"${outfile}" >>"$LOG_FILE" 2>&1; then
+      /TargetFile:"${outfile}" 2>&1 | tee -a "$LOG_FILE" >"$live"; then
     log ERROR "[${name}] SqlPackage export failed for ${db} (details above in ${LOG_FILE})"
     rm -f "$outfile"
     return 1
   fi
+  local took=$(( SECONDS - started ))
+  log INFO "[${name}] exported ${db} in $(( took / 60 ))m $(( took % 60 ))s ($(du -h "$outfile" | cut -f1)) — uploading"
 
   sha256_sidecar "$outfile"
   local rc=0
