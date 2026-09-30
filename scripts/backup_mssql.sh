@@ -1,20 +1,5 @@
 #!/usr/bin/env bash
-# Backs up every SQL Server defined in config/backup.env to GCS as .bacpac
-# exports (schema + data, via SqlPackage). Backup-only by design.
-#
-# backup.env is the only thing that changes between servers. Each SQL Server
-# is one numbered block with its full connection details:
-#   MSSQL_1_CONTAINER / _HOST / _PORT / _USER / _PASSWORD_FILE / _DATABASE
-#   MSSQL_2_...
-# The script finds every block (1, 2, 3, ... in number order), builds a queue
-# from them and backs them up one at a time, one database at a time — never
-# in parallel. A failure in one server is logged and the queue moves on; the
-# run exits non-zero (and alerts) at the end if anything failed.
-#
-# GCS layout (one folder per container, rolling DAILY_RETENTION_DAYS):
-#   gs://<GCS_BUCKET>/<GCS_PREFIX>/<container>/<YYYY-MM-DD_HHMMSS>/<db>_<stamp>.bacpac(.sha256)
-#
-# Usage: backup_mssql.sh [--dry-run] [--only <container>]
+
 
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,8 +14,7 @@ MIN_FREE_GB="${MIN_FREE_GB:-20}"
 [[ "$MIN_FREE_GB" =~ ^[0-9]+$ ]] || die "MIN_FREE_GB must be a whole number (got: ${MIN_FREE_GB})"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-30}"
 
-# SqlPackage stages table data in the temp dir before building the .bacpac —
-# keep that on the backup staging disk rather than /tmp.
+
 export TMPDIR="${BACKUP_TMP_DIR}"
 
 DRY_RUN=0

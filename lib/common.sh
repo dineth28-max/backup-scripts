@@ -99,12 +99,7 @@ sha256_sidecar() {
   ( cd "$(dirname "$file")" && sha256sum "$(basename "$file")" ) > "${file}.sha256"
 }
 
-# Keeps the newest N days of backup folders under ${GCS_PREFIX}/<folder>/.
-# Folders are named <YYYY-MM-DD_HHMMSS>, so the date is read from the folder
-# name (same clock as the backup stamp) rather than from GCS object times.
-# With N=3, a run on the 4th day deletes the 1st day's folder: 3 days remain.
-# The cutoff is counted from the run's own date (<ref_date>, YYYY-MM-DD), not
-# from "now", so a long run that crosses midnight still keeps exactly N days.
+
 prune_gcs_folder() {
   local folder="$1" days="$2" ref_date="$3"
   local cutoff listing url stamp
