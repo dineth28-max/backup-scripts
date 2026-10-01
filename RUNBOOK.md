@@ -56,32 +56,7 @@ name from `backup.env`.
 bash scripts/backup_mssql.sh
 ```
 
-This single command is the whole backup. It does exactly what cron does at
-02:00. It walks every `MSSQL_<n>_*` block in `backup.env` **one at a time**
-(1, 2, 3 …). Nothing runs in parallel. For each block it:
 
-1. exports each database to a `.bacpac` (the live SqlPackage output is shown on screen)
-2. uploads the `.bacpac` + `.sha256` to `gs://<GCS_BUCKET>/<GCS_PREFIX>/<container>/<stamp>/`
-3. deletes the local copy
-4. deletes that container's backup folders older than 3 days
-
-If one server fails, it is logged and the queue moves on to the next.
-
-With the current `backup.env` (5 servers) a successful run looks like:
-
-```
-[INFO] Queue: 5 SQL Server(s) defined in backup.env
-[INFO] --- [sqlserver1] sa@localhost:1433 ---
-...
-[INFO] [sqlserver1] antler done
-[INFO] --- [ms-sql-server-dev-antlerhrmdfc] sa@localhost:13727 ---
-...
-[INFO] [sqlserver4] antler done
-[INFO] === backup_mssql.sh completed successfully (5 instances) ===
-```
-
-If anything failed, the last line is instead
-`=== finished with failures: N failed, M ok. Failed: <names> ===`.
 
 ### 2c. Check that every SQL Server landed in GCS
 
@@ -99,19 +74,15 @@ sha256sum -c *.sha256
 cd - && rm -rf /tmp/verify
 ```
 
-A `.bacpac` of only a few KB usually means an empty database. Compare sizes
-between runs.
 
 ## 3. Schedule
 
 ```bash
-timedatectl | grep 'Time zone'     # UTC server -> BACKUP_CRON_SCHEDULE="30 20 * * *" for 02:00 Sri Lanka
-bash scripts/install_cron.sh       # must print "= 02:00 Sri Lanka time"
+timedatectl | grep 'Time zone'     
+bash scripts/install_cron.sh       
 crontab -l
 ```
 
-From then on, `bash scripts/backup_mssql.sh` (step 2b) runs by itself every
-night. Check the result each morning:
 
 ```bash
 tail -3 <LOG_DIR>/backup_mssql_$(date +%F).log   # last line should say "completed successfully"

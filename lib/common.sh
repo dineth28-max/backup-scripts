@@ -3,9 +3,15 @@
 
 set -euo pipefail
 
-# cron runs with PATH=/usr/bin:/bin, which misses sqlpackage (/usr/local/bin)
-# and a snap-installed gcloud (/snap/bin).
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:${PATH:-}"
+# cron runs with PATH=/usr/bin:/bin, which misses sqlpackage (/usr/local/bin,
+# /opt/sqlpackage, or ~/.dotnet/tools for a `dotnet tool` install) and a
+# snap-installed gcloud (/snap/bin).
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:/opt/sqlpackage:${HOME:-/root}/.dotnet/tools:${PATH:-}"
+# A `dotnet tool` sqlpackage needs DOTNET_ROOT to find the runtime when the
+# runtime lives in ~/.dotnet (cron doesn't load ~/.bashrc, which normally sets it).
+if [[ -z "${DOTNET_ROOT:-}" && -d "${HOME:-/root}/.dotnet" ]]; then
+  export DOTNET_ROOT="${HOME:-/root}/.dotnet"
+fi
 
 BACKUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${BACKUP_ROOT}/config/backup.env"

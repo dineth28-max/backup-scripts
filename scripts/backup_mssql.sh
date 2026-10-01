@@ -28,13 +28,16 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-if [[ "$DRY_RUN" -eq 0 ]]; then
-  command -v sqlpackage >/dev/null 2>&1 || die "sqlpackage not found on PATH (see README section 3)"
-fi
+# Checked on --dry-run too (and actually executed), so a dry run under cron's
+# environment proves the real run will find a working sqlpackage.
+command -v sqlpackage >/dev/null 2>&1 || die "sqlpackage not found on PATH=${PATH} (see README section 3)"
+SQLPACKAGE_VERSION="$(sqlpackage /version 2>&1 | tail -1)" \
+  || die "sqlpackage at $(command -v sqlpackage) does not run: ${SQLPACKAGE_VERSION}"
 
 acquire_lock
 STAMP="$(date +%F_%H%M%S)"
 log INFO "=== backup_mssql.sh starting (stamp=${STAMP}, dry_run=${DRY_RUN}${ONLY:+, only=${ONLY}}) ==="
+log INFO "sqlpackage: $(command -v sqlpackage) (version ${SQLPACKAGE_VERSION})"
 if [[ -n "${ALERT_EMAIL:-}" ]] && ! command -v mail >/dev/null 2>&1; then
   log WARN "ALERT_EMAIL is set but the 'mail' command is not installed — failure emails will NOT be sent"
 fi
